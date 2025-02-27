@@ -26,16 +26,18 @@ interface PackageJSON {
     | string
     | PackageExportsEntry[]
     | {
-        [k: `${NotDot}${string}`]: PackageExportsEntry | PackageExportsFallback;
-      }
+      [k: `${NotDot}${string}`]: PackageExportsEntry | PackageExportsFallback;
+    }
     // map of paths
     | ExportsPathMap;
 }
 
 const normalizeURLPath = (str: string): `.${string}` =>
-  `.${toFileUrl(fromFileUrl("file:///" + str))
-    .href.slice("file://".length)
-    .replace(/\/$/, "")}${str.endsWith("/") ? "/" : ""}`;
+  `.${
+    toFileUrl(fromFileUrl("file:///" + str))
+      .href.slice("file://".length)
+      .replace(/\/$/, "")
+  }${str.endsWith("/") ? "/" : ""}`;
 const parsePattern = (str: string) => {
   const match = str.match(/\*|\/$/g);
   if (match === null) return;
@@ -80,7 +82,7 @@ export async function importSubpaths(packagePath: string) {
     }
   }
   function allPaths(
-    entry: PackageExportsEntry | PackageExportsFallback
+    entry: PackageExportsEntry | PackageExportsFallback,
   ): string[] {
     if (entry == null) return [];
     if (typeof entry === "string") return [entry];
@@ -98,13 +100,15 @@ export async function importSubpaths(packagePath: string) {
       if (specifierPattern == null) {
         specifiers.add(specifier);
       } else {
-        for (const targetPath of allPaths(exports[specifier]).map(
-          normalizeURLPath
-        )) {
+        for (
+          const targetPath of allPaths(exports[specifier]).map(
+            normalizeURLPath,
+          )
+        ) {
           const targetPattern = parsePattern(targetPath);
           assert(
             targetPattern,
-            `target '${targetPath}' of specifier '${specifier}' is not a pattern`
+            `target '${targetPath}' of specifier '${specifier}' is not a pattern`,
           );
           patterns.push({ targetPattern, specifierPattern });
         }
@@ -122,23 +126,21 @@ export async function importSubpaths(packagePath: string) {
   }
   if (patterns.length) {
     for await (const item of expandGlob("**/*", { root: packagePath })) {
-      const child =
-        "." +
+      const child = "." +
         toFileUrl("/" + relative(packagePath, item.path)).href.slice(
-          "file://".length
+          "file://".length,
         );
       outer: for (const e of patterns) {
         if (
           child.startsWith(e.targetPattern.prefix) &&
           child.endsWith(e.targetPattern.suffix)
         ) {
-          let candidate =
-            e.specifierPattern.prefix +
+          let candidate = e.specifierPattern.prefix +
             child.slice(
               e.targetPattern.prefix.length,
               e.targetPattern.suffix
                 ? 0 - e.targetPattern.suffix.length
-                : Infinity
+                : Infinity,
             ) +
             e.specifierPattern.suffix;
           if (candidate === "./") candidate = ".";

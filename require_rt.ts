@@ -6,11 +6,11 @@ declare const m: Record<
   | { j: unknown; i: undefined; x: undefined; m: undefined }
   | { i(): void; x(): unknown; j: undefined; m: undefined }
   | {
-      m: Record<PropertyKey, unknown>;
-      j: undefined;
-      i: undefined;
-      x: undefined;
-    }
+    m: Record<PropertyKey, unknown>;
+    j: undefined;
+    i: undefined;
+    x: undefined;
+  }
 >;
 // deno-lint-ignore prefer-const
 declare let require: unknown;
@@ -23,16 +23,18 @@ const __Error = Error;
 const __copyProps = (
   to: Record<PropertyKey, unknown>,
   from: Record<PropertyKey, unknown>,
-  desc?: PropertyDescriptor
+  desc?: PropertyDescriptor,
 ) => {
   if ((from && typeof from === "object") || typeof from === "function") {
     const names = __getOwnPropNames(from);
-    for (let key = names[0], i = 0; i < names.length; key = names[++i])
-      if (!__hasOwn(to, key))
+    for (let key = names[0], i = 0; i < names.length; key = names[++i]) {
+      if (!__hasOwn(to, key)) {
         __defProp(to, key, {
           get: () => from[key],
           enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable,
         });
+      }
+    }
   }
   return to;
 };
