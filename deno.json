@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "run": "deno serve --no-prompt --allow-net --allow-read=require_rt.ts --allow-read=\"$HOME/.cache,tmp,cache\" --allow-write=\"tmp,cache\" serve.ts"
+  },
+  "nodeModulesDir": "none"
+}
