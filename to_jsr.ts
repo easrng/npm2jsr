@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-inner-declarations
 import {
   defaultResolve as nodeResolve,
   ErrnoException,
@@ -26,6 +27,7 @@ import swcInit, { transformSync } from "npm:@swc/wasm-web";
 import jsTokens from "npm:js-tokens";
 import { crypto } from "jsr:@std/crypto";
 import { encodeHex } from "jsr:@std/encoding/hex";
+import { basename } from "jsr:@std/path/posix/basename";
 
 const jsrScope = "npm";
 const [requireRt] = await Promise.all([
@@ -37,12 +39,11 @@ const [requireRt] = await Promise.all([
   cjsLexer.init(),
 ]);
 const requireImplCache: Record<string, string> = {};
-function makeRequire(hasCjs: boolean, hasEsm: boolean, hasJson: boolean) {
-  const cached = requireImplCache["" + hasCjs + hasEsm + hasJson];
+function makeRequire(hasCjs: boolean, hasJson: boolean) {
+  const cached = requireImplCache["" + hasCjs + hasJson];
   if (cached) return cached;
   const { code } = transformSync(
-    `const HAS_CJS=${hasCjs},HAS_ESM=${hasEsm},HAS_JSON=${hasJson};` +
-      requireRt,
+    `const HAS_CJS=${hasCjs},HAS_JSON=${hasJson};` + requireRt,
     {
       filename: "require_rt.ts",
       minify: true,
@@ -54,7 +55,7 @@ function makeRequire(hasCjs: boolean, hasEsm: boolean, hasJson: boolean) {
       },
     },
   );
-  requireImplCache["" + hasCjs + hasEsm + hasJson] = code;
+  requireImplCache["" + hasCjs + hasJson] = code;
   return code;
 }
 
@@ -100,6 +101,137 @@ function encodePackageName(pkg: string) {
     throw new TypeError("can't encode scope name unambiguously");
   }
   return `${match[1]}__${match[2]}`;
+}
+
+export function extractIdentifiers(
+  param: oxt.BindingPattern | oxt.BindingRestElement,
+  nodes: oxt.IdentifierName[] = [],
+) {
+  switch (param.type) {
+    case "Identifier":
+      nodes.push(param);
+      break;
+
+    case "ObjectPattern":
+      for (const prop of param.properties) {
+        if (prop.type === "RestElement") {
+          extractIdentifiers(prop.argument, nodes);
+        } else {
+          extractIdentifiers(prop.value, nodes);
+        }
+      }
+
+      break;
+
+    case "ArrayPattern":
+      for (const element of param.elements) {
+        if (element) extractIdentifiers(element, nodes);
+      }
+
+      break;
+
+    case "RestElement":
+      extractIdentifiers(param.argument, nodes);
+      break;
+
+    case "AssignmentPattern":
+      extractIdentifiers(param.left, nodes);
+      break;
+
+    default: {
+      const _: never = param;
+    }
+  }
+
+  return nodes;
+}
+
+async function getExports(
+  path: string,
+  exportNames = new Set<string>(),
+  files = new Set<string>(),
+  addDefault = true,
+) {
+  const text = await Deno.readTextFile(path);
+  const url = toFileUrl(path);
+  const format = defaultGetFormatWithoutErrors(url, {
+    parentURL: undefined as never,
+  });
+  if (format === "commonjs") {
+    const { exports, reexports } = cjsLexer.parse(text) as {
+      exports: string[];
+      reexports: string[];
+    };
+    for (const e of exports) {
+      if (e === "default" && !addDefault) continue;
+      exportNames.add(e);
+    }
+    const cjsResolver = createRequire(path);
+    await Promise.all(
+      reexports.flatMap((name) => {
+        try {
+          const path = cjsResolver.resolve(name);
+          if (path[0] !== "/") return [];
+          if (files.has(path)) return;
+          files.add(path);
+          return getExports(path, exportNames, files);
+        } catch (e) {
+          console.warn(e);
+          return [];
+        }
+      }),
+    );
+  } else if (format === "module") {
+    const tree = parseSync(text, { sourceType: "module" });
+    try {
+      for (const node of tree.program.body) {
+        if (node.type === "ExportDefaultDeclaration") {
+          if (addDefault) exportNames.add("default");
+        } else if (node.type === "ExportAllDeclaration") {
+          try {
+            const path = fromFileUrl(
+              nodeResolve(node.source.value, { parentURL: url.href }).url,
+            );
+            if (files.has(path)) continue;
+            files.add(path);
+            getExports(path, exportNames, files, false);
+          } catch (e) {
+            console.warn(e);
+          }
+        } else if (node.type === "ExportNamedDeclaration") {
+          for (const specifier of node.specifiers) {
+            const name = specifier.exported.type === "Identifier"
+              ? specifier.exported.name
+              : specifier.exported.value;
+            if (addDefault || name !== "default") exportNames.add(name);
+          }
+          const decl = node.declaration;
+          if (
+            decl?.type === "ClassDeclaration" ||
+            decl?.type === "FunctionDeclaration" ||
+            decl?.type === "ClassExpression" ||
+            decl?.type === "FunctionExpression"
+          ) {
+            if (decl.id?.name) {
+              exportNames.add(decl.id?.name);
+            }
+          }
+          if (decl?.type === "VariableDeclaration") {
+            for (
+              const { name } of decl.declarations.flatMap((e) =>
+                extractIdentifiers(e.id)
+              )
+            ) {
+              if (addDefault || name !== "default") exportNames.add(name);
+            }
+          }
+        }
+      }
+    } finally {
+      tree.free();
+    }
+  }
+  return exportNames;
 }
 
 function anyNodeResolve(specifier: string, parent: string) {
@@ -173,15 +305,45 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
     })
   ).default;
   const map: Record<string, string> = {};
-  const virtual: {
-    path: string;
-    isDirectory: boolean;
-    format?: string;
-    text?: string;
-  }[] = [];
   const realPackagePath = dirname(
     await Deno.realPath(npmPackagePath + "/package.json"),
   );
+  async function makeEsmWrapper(targetPath: string) {
+    const wrapPath = await Deno.realPath(targetPath).then(
+      (r) => relative(realPackagePath, r + ".cjsWrapper.js"),
+      () => relative(npmPackagePath, targetPath + ".cjsWrapper.js"),
+    );
+    const addEsmPath = await Deno.realPath(targetPath).then(
+      (r) => relative(realPackagePath, r + ".addEsModule.js"),
+      () => relative(npmPackagePath, targetPath + ".addEsModule.js"),
+    );
+    const exports = await getExports(targetPath);
+    await Deno.mkdir(dirname(resolve(outputPath, wrapPath)), {
+      recursive: true,
+    });
+    const moduleExports = exports.has("module.exports");
+    const addEsModule = !moduleExports && !exports.has("__esModule") &&
+      exports.has("default");
+    if (addEsModule) {
+      const s = JSON.stringify(toRelativeUrl(basename(targetPath)));
+      await Deno.writeTextFile(
+        resolve(outputPath, addEsmPath),
+        `export*from${s};export{default}from${s};export let __esModule=true`,
+      );
+    }
+    await Deno.writeTextFile(
+      resolve(outputPath, wrapPath),
+      `export ${
+        moduleExports ? '{ "module.exports" as default }' : "* as default"
+      } from${
+        JSON.stringify(
+          toRelativeUrl(
+            basename(targetPath) + (addEsModule ? ".addEsModule.js" : ""),
+          ),
+        )
+      }`,
+    );
+  }
   for (const path of await importSubpaths(npmPackagePath)) {
     esm: {
       const specifier = packageJson.name + path.slice(1);
@@ -236,25 +398,29 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
       let key = toRelativeUrl(rp);
       if (format === "module" || format === "json") {
         key += ".cjsExport.js";
-        virtual.push({
-          path: resolve(npmPackagePath, rp + ".cjsExport.js"),
-          isDirectory: false,
-          format: "commonjs",
-          text: "module.exports = require(" +
-            JSON.stringify("./" + rp.split("/").at(-1)) +
-            ")",
-        });
+        if (format === "module") {
+          await makeEsmWrapper(targetPath);
+        }
+        await Deno.writeTextFile(
+          resolve(outputPath, rp + ".cjsExport.js"),
+          `import data from${
+            JSON.stringify(
+              toRelativeUrl(
+                basename(rp) + (format === "module" ? ".cjsWrapper.js" : ""),
+              ),
+            )
+          }${
+            format === "json" ? 'with{type:"json"}' : ""
+          };export default()=>data`,
+        );
       }
       map["./__commonjs" + path.slice(1)] = key;
     }
   }
   for await (
-    const item of (async function* () {
-      yield* expandGlob("**/*", {
-        root: npmPackagePath,
-      }) as AsyncIterable<(typeof virtual)[number]>;
-      yield* virtual;
-    })()
+    const item of expandGlob("**/*", {
+      root: npmPackagePath,
+    })
   ) {
     const itemUrl = toFileUrl(item.path);
     const outputItemPath = resolve(
@@ -262,26 +428,26 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
       relative(npmPackagePath, item.path),
     );
     if (/\.[cm]?js$/.test(item.path)) {
-      const format = item.format ??
-        defaultGetFormatWithoutErrors(itemUrl, {
-          parentURL: parent,
-        });
-      const text = item.text ?? (await Deno.readTextFile(item.path));
+      const format = defaultGetFormatWithoutErrors(itemUrl, {
+        parentURL: parent,
+      });
+      const text = await Deno.readTextFile(item.path);
       const magicString = new MagicString(text);
       if (format === "module") {
-        // oxc returns offsets in utf8 bytes, but we want utf16 code units
-        // replace multibyte code units with 'x' to make things line up
-        const ast = parseSync(text.replace(/[\x7f-\uffff]/g, "x"), {
+        const ast = parseSync(text, {
           sourceFilename: item.path,
           sourceType: format === "module" ? "module" : "script",
         });
         try {
-          // deno-lint-ignore no-inner-declarations
           async function rewriteImport(node: oxt.StringLiteral) {
             let replaceWith: string | undefined;
             // absolute url already
-            if (/^[^\/]+:/.test(node.value)) return;
-            const [, module, subpath] =
+            if (
+              /^[^\/]+:/.test(node.value) && !node.value.startsWith("node:")
+            ) {
+              return;
+            }
+            let [, module, subpath] =
               node.value.match(/^(@[^\/@]*\/[^\/@]*|[^\/@]+)((?:\/.*)?)$/) ||
               [];
             // relative url
@@ -289,7 +455,7 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
               /^\.\.?(\/|$)/.test(node.value) ||
               module === packageJson.name
             ) {
-              const realItemDirPath = dirname(await Deno.realPath(item.path));
+              const realItemDirPath = await Deno.realPath(dirname(item.path));
               const resolved = anyNodeResolve(node.value, itemUrl.href);
               let targetPath = fromFileUrl(resolved);
               targetPath = await Deno.realPath(targetPath).then(
@@ -307,8 +473,12 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                   : "");
             } else {
               // bare specifier
-              if (builtinModules.includes(module + subpath)) {
-                return "node:" + module + subpath;
+              if (
+                builtinModules.includes(module + subpath) ||
+                module.startsWith("node:")
+              ) {
+                subpath = "/" + module.replace(/^node:/, "") + subpath;
+                module = "@easrng/node-shim";
               }
               const version = packageJson.dependencies?.[module] ??
                 packageJson.devDependencies?.[module] ??
@@ -379,16 +549,15 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
           const cjsInfo = analyzeCommonJS(text, item.path);
           const cjsResolver = createRequire(item.path);
           let hasCjs = false,
-            hasEsm = false,
             hasJson = false;
           const requires = (
             await Promise.allSettled(
               (cjsInfo?.requires as string[] | undefined)?.map(async (id) => {
-                const [, module, subpath] =
+                let [, module, subpath] =
                   id.match(/^(@[^\/@]*\/[^\/@]*|[^\/@]+)((?:\/.*)?)$/) || [];
                 // relative
                 if (/^\.\.?(\/|$)/.test(id) || module === packageJson.name) {
-                  let targetPath = cjsResolver.resolve(id);
+                  const targetPath = cjsResolver.resolve(id);
                   const format = defaultGetFormatWithoutErrors(
                     toFileUrl(targetPath),
                     {
@@ -399,31 +568,40 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                     (r) => dirname(r),
                     () => dirname(item.path),
                   );
-                  targetPath = await Deno.realPath(targetPath).then(
+                  let relativeTargetPath = await Deno.realPath(targetPath).then(
                     (r) => relative(realItemDirPath, r),
                     () => relative(dirname(item.path), targetPath),
                   );
-                  targetPath += targetPath.endsWith(".cjs") ? "Wrap.js" : "";
-                  if (!targetPath.startsWith("../")) {
-                    targetPath = "./" + targetPath;
+                  relativeTargetPath += relativeTargetPath.endsWith(".cjs")
+                    ? ".js"
+                    : "";
+                  if (!relativeTargetPath.startsWith("../")) {
+                    relativeTargetPath = "./" + relativeTargetPath;
                   }
-                  if (format === "module") hasEsm = true;
+                  if (format === "module") {
+                    await makeEsmWrapper(targetPath);
+                    hasJson = true;
+                    return {
+                      id,
+                      path: relativeTargetPath + ".cjsWrapper.js",
+                      format: "module",
+                    };
+                  }
                   if (format === "json") hasJson = true;
                   if (format === "commonjs") hasCjs = true;
                   return {
                     id,
-                    path: toRelativeUrl(targetPath),
+                    path: toRelativeUrl(relativeTargetPath),
                     format,
                   };
                 } else {
                   // bare specifier
-                  if (builtinModules.includes(module + subpath)) {
-                    hasJson = true;
-                    return {
-                      id,
-                      path: "node:" + module + subpath,
-                      format: "builtin",
-                    };
+                  if (
+                    builtinModules.includes(module + subpath) ||
+                    module.startsWith("node:")
+                  ) {
+                    subpath = "/" + module.replace(/^node:/, "") + subpath;
+                    module = "@easrng/node-shim";
                   }
                   const version = packageJson.dependencies?.[module] ??
                     packageJson.devDependencies?.[module] ??
@@ -440,8 +618,10 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                 }
               }) || [],
             )
-          ).flatMap((e) => (e.status === "fulfilled" ? e.value : []));
-          const toShadow = ["cjs_exports", "cjs_init", "inited"];
+          ).flatMap((e) =>
+            e.status === "fulfilled" ? e.value : (console.warn(e.reason), [])
+          );
+          const toShadow = ["inited"];
           const idMappings = ["__proto__:null"];
           magicString.prepend(
             requires
@@ -458,123 +638,89 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                     )
                   }with{type:"json"};`;
                 }
-                if (format === "builtin") {
-                  toShadow.push(`b_${i}`);
-                  idMappings.push(`${key}:{j:b_${i}}`);
-                  return `import b_${i} from${JSON.stringify(path)};`;
+                if (format === "module") {
+                  toShadow.push(`m_${i}`);
+                  idMappings.push(`${key}:{j:m_${i}}`);
+                  return `import m_${i} from${JSON.stringify(path)};`;
                 }
                 if (format === "commonjs") {
-                  toShadow.push(`i_${i}`, `x_${i}`);
-                  idMappings.push(`${key}:{i:i_${i},x:()=>x_${i}}`);
-                  return `import {cjs_init as i_${i},cjs_exports as x_${i}} from${
-                    JSON.stringify(
-                      path,
-                    )
-                  };`;
+                  toShadow.push(`i_${i}`);
+                  idMappings.push(`${key}:{i:i_${i}}`);
+                  return `import i_${i} from${JSON.stringify(path)};`;
                 }
                 toShadow.push(`m_${i}`);
                 idMappings.push(`${key}:{m:m_${i}}`);
                 return `import * as m_${i} from ${JSON.stringify(path)};`;
               })
               .join("") +
-              `let inited;export let cjs_exports={};export function cjs_init(){if(inited)return;inited=true;let exports=cjs_exports,module=Object.defineProperty({},"exports",{get(){return cjs_exports},set(x){cjs_exports=x}}),require,define,global=globalThis;{const m={${
+              `let inited;let module={exports:{}},exports=module.export,require,define,global=globalThis;{const m={${
                 idMappings.join(
                   ",",
                 )
-              }};${makeRequire(hasCjs, hasEsm, hasJson)}}{let ${
+              }};${
+                makeRequire(
+                  hasCjs,
+                  hasJson,
+                )
+              }};export default function(){if(inited)return module.exports;inited=true;{let ${
                 toShadow.join(
                   ",",
                 )
               };{`,
           );
-          magicString.append(`\n}}}`);
-          if (!outputItemPath.endsWith(".cjsExport.js")) {
-            const exports = await (async function getReexports(
-              path: string,
-              text: string,
-              exportNames = new Set<string>(),
-              files = new Set<string>(),
-            ) {
-              const { exports, reexports } = cjsLexer.parse(text) as {
-                exports: string[];
-                reexports: string[];
-              };
-              for (const e of exports) exportNames.add(e);
-              const cjsResolver = createRequire(path);
-              await Promise.all(
-                reexports.flatMap((name) => {
-                  try {
-                    const path = cjsResolver.resolve(name);
-                    if (path[0] !== "/") return [];
-                    if (files.has(path)) return;
-                    files.add(path);
-                    return Deno.readTextFile(path).then((text) =>
-                      getReexports(path, text, exportNames, files)
-                    );
-                  } catch {
-                    return [];
-                  }
-                }),
-              );
-              return exportNames;
-            })(item.path, text);
-            const names = new Set();
-            // deno-lint-ignore no-inner-declarations
-            function claim(base: string) {
-              let i = 0;
-              do {
-                const name = base + (i ? "_" + i : "");
-                if (!names.has(name)) return name;
-                i++;
-              } while (true);
-            }
-            const exportsName = claim("exports");
-            const initName = claim("init");
-            const exportBindings = [...exports]
-              .filter((e) => e !== "default")
-              .map((e) => [
-                claim(
-                  e
-                    .replace(/[^a-zA-Z0-9_]/g, "_")
-                    .replace(
-                      /^\d|^(?:arguments|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|eval|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|static|super|switch|this|throw|true|try|typeof|var|void|while|with|yield)$/,
-                      "_$&",
-                    ),
-                ),
-                Identifier.test(e) ? e : JSON.stringify(e),
-              ]);
-            const importCjs = toRelativeUrl(
-              item.path.split("/").at(-1) +
-                (item.path.endsWith(".cjs") ? "Wrap.js" : ""),
-            );
-            await Deno.writeTextFile(
-              outputItemPath + ".cjsInit.js",
-              `export{cjs_exports as default}from${
-                JSON.stringify(
-                  importCjs,
-                )
-              };import{cjs_exports as ${exportsName},cjs_init as ${initName}}from${
-                JSON.stringify(
-                  importCjs,
-                )
-              };${initName}()` +
-                (exportBindings.length
-                  ? `;const{${
-                    exportBindings
-                      .map(([local, real]) =>
-                        real === local ? real : real + ":" + local
-                      )
-                      .join(",")
-                  }}=${exportsName};export{${
-                    exportBindings
-                      .map(([local, real]) =>
-                        real === local ? real : local + " as " + real
-                      )
-                      .join(",")
-                  }}`
-                  : ""),
-            );
+          magicString.append(`\n}}return module.exports}`);
+          const exports = await getExports(item.path);
+          const names = new Set();
+          function claim(base: string) {
+            let i = 0;
+            do {
+              const name = base + (i ? "_" + i : "");
+              if (!names.has(name)) return name;
+              i++;
+            } while (true);
           }
+          const initName = claim("init");
+          const exportsName = claim("exports");
+          const exportBindings = [...exports]
+            .filter((e) => e !== "default")
+            .map((e) => [
+              claim(
+                e
+                  .replace(/[^a-zA-Z0-9_]/g, "_")
+                  .replace(
+                    /^\d|^(?:arguments|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|eval|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|static|super|switch|this|throw|true|try|typeof|var|void|while|with|yield)$/,
+                    "_$&",
+                  ),
+              ),
+              Identifier.test(e) ? e : JSON.stringify(e),
+            ]);
+          const importCjs = toRelativeUrl(
+            basename(item.path) + (item.path.endsWith(".cjs") ? ".js" : ""),
+          );
+          await Deno.writeTextFile(
+            outputItemPath + ".cjsInit.js",
+            `import ${initName} from${
+              JSON.stringify(
+                importCjs,
+              )
+            };const ${exportsName}=${initName}()` +
+              (exportBindings.length
+                ? `,{${
+                  exportBindings
+                    .map(([local, real]) =>
+                      real === local ? real : real + ":" + local
+                    )
+                    .join(",")
+                }}=${exportsName};export{${
+                  exportBindings
+                    .map(([local, real]) =>
+                      real === local ? real : local + " as " + real
+                    )
+                    .join(",")
+                }}`
+                : ``) +
+              `;export{${exportsName} as default,${exportsName} as"module.exports"}`,
+          );
         } catch (e) {
           if (
             /Unexpected (im|ex)port statement in CJS module/.test(String(e))
@@ -607,7 +753,7 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
         }
         if (
           tok.type !== "WhiteSpace" &&
-          !tok.type.endsWith("HashbangComment")
+          !tok.type.endsWith("Comment")
         ) {
           prev.push([pos, tok.value]);
           prev.shift();
@@ -628,12 +774,12 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
         pos += tok.value.length;
       }
       await Deno.writeTextFile(
-        outputItemPath + (outputItemPath.endsWith(".cjs") ? "Wrap.js" : ""),
+        outputItemPath + (outputItemPath.endsWith(".cjs") ? ".js" : ""),
         magicString.toString(),
       );
     } else if (item.isDirectory) {
-      await Deno.mkdir(outputItemPath);
-    } else if (item.path.endsWith("package.json")) {
+      await Deno.mkdir(outputItemPath, { recursive: true });
+    } else if (item.path.endsWith("/package.json")) {
       const pkg = JSON.parse(await Deno.readTextFile(item.path));
       pkg.type = "module";
       await Deno.writeTextFile(outputItemPath, JSON.stringify(pkg, null, 2));

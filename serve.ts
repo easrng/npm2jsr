@@ -54,14 +54,16 @@ function ensureCached(pkg: string, version: string) {
         ) {
           const tarPath = normalize(entry.path);
           assert(
-            tarPath.startsWith("package/"),
+            tarPath === "package" || tarPath.startsWith("package/"),
             "paths in tarball should start with 'package'",
           );
-          const path = normalize(
-            indir + "/" + tarPath.slice("package/".length),
-          );
-          await Deno.mkdir(dirname(path), { recursive: true });
-          await entry.readable?.pipeTo((await Deno.create(path)).writable);
+          const path = normalize(indir + "/" + tarPath.slice("package".length));
+          if (entry.header.typeflag === "0") {
+            await Deno.mkdir(dirname(path), { recursive: true });
+            await entry.readable?.pipeTo((await Deno.create(path)).writable);
+          } else if (entry.header.typeflag === "5") {
+            await Deno.mkdir(path, { recursive: true });
+          }
         }
         await npmToJsr(indir, dir + "/output");
         await Deno.mkdir(dirname(cachePath), { recursive: true });
@@ -134,7 +136,7 @@ async function handle(req: Request): Promise<Response> {
       showIndex: false,
       showDotfiles: true,
       quiet: true,
-      urlRoot: normalize(decodeURIComponent(match[3].slice(1))),
+      urlRoot: normalize(decodeURIComponent(match[3].slice(1, -1))),
     });
   }
   return new Response("Not Found", {
