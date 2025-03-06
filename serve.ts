@@ -3,7 +3,7 @@ import { UntarStream } from "jsr:@std/tar/untar-stream";
 import { dirname } from "jsr:@std/path/posix/dirname";
 import { normalize } from "jsr:@std/path/posix/normalize";
 import { fromFileUrl } from "jsr:@std/path/posix/from-file-url";
-import { serveDir } from "jsr:@std/http/file-server";
+import { serveDir, serveFile } from "jsr:@std/http/file-server";
 import { assert } from "jsr:@std/assert/assert";
 import { npmToJsr } from "./to_jsr.ts";
 
@@ -120,9 +120,7 @@ async function handle(req: Request): Promise<Response> {
       ? encoded
       : `@${encoded.slice(0, scope)}/${encoded.slice(scope + 2)}`;
     const path = await ensureCached(pkg, version);
-    return Response.json(
-      JSON.parse(await Deno.readTextFile(path + "/_meta.json")),
-    );
+    return await serveFile(req, path + "/_meta.json");
   } else if (match?.[3]) {
     const [encoded, version] = match[3].slice(6, -1).split("/");
     const scope = encoded.indexOf("__");

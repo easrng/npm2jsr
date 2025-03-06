@@ -324,6 +324,9 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
     const moduleExports = exports.has("module.exports");
     const addEsModule = !moduleExports && !exports.has("__esModule") &&
       exports.has("default");
+    await Deno.mkdir(dirname(resolve(outputPath, addEsmPath)), {
+      recursive: true,
+    });
     if (addEsModule) {
       const s = JSON.stringify(toRelativeUrl(basename(targetPath)));
       await Deno.writeTextFile(
@@ -398,6 +401,9 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
       let key = toRelativeUrl(rp);
       if (format === "module" || format === "json") {
         key += ".cjsExport.js";
+        await Deno.mkdir(dirname(resolve(outputPath, rp + ".cjsExport.js")), {
+          recursive: true,
+        });
         if (format === "module") {
           await makeEsmWrapper(targetPath);
         }
@@ -653,7 +659,7 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                 return `import * as m_${i} from ${JSON.stringify(path)};`;
               })
               .join("") +
-              `let inited;let module={exports:{}},exports=module.export,require,define,global=globalThis;{const m={${
+              `let inited;let module={exports:{}},exports=module.exports,require,define,global=globalThis;{const m={${
                 idMappings.join(
                   ",",
                 )
