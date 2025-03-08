@@ -13,7 +13,6 @@ import { relative } from "jsr:@std/path/posix/relative";
 import { dirname } from "jsr:@std/path/posix/dirname";
 import { assert } from "jsr:@std/assert/assert";
 import { expandGlob } from "jsr:@std/fs/expand-glob";
-import { analyzeCommonJS } from "npm:@endo/cjs-module-analyzer";
 // @deno-types="https://cdn.jsdelivr.net/npm/cjs-module-lexer@2.1.0/lexer.d.ts"
 import * as cjsLexer from "https://cdn.jsdelivr.net/npm/cjs-module-lexer@2.1.0/dist/lexer.mjs";
 import oxcInit, {
@@ -158,10 +157,16 @@ async function getExports(
     parentURL: undefined as never,
   });
   if (format === "commonjs") {
-    const { exports, reexports } = cjsLexer.parse(text) as {
-      exports: string[];
-      reexports: string[];
-    };
+    let exports, reexports;
+    try {
+      ({ exports, reexports } = cjsLexer.parse(text) as {
+        exports: string[];
+        reexports: string[];
+      });
+    } catch {
+      // ignore errors
+    }
+    if (!exports || !reexports) return exportNames;
     for (const e of exports) {
       if (e === "default" && !addDefault) continue;
       exportNames.add(e);
@@ -182,7 +187,13 @@ async function getExports(
       }),
     );
   } else if (format === "module") {
-    const tree = parseSync(text, { sourceType: "module" });
+    let tree;
+    try {
+      tree = parseSync(text, { sourceType: "module" });
+    } catch {
+      // ignore errors
+    }
+    if (!tree) return exportNames;
     try {
       for (const node of tree.program.body) {
         if (node.type === "ExportDefaultDeclaration") {
@@ -350,7 +361,12 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
   for (const path of await importSubpaths(npmPackagePath)) {
     esm: {
       const specifier = packageJson.name + path.slice(1);
-      const url = anyNodeResolve(specifier, parent);
+      let url;
+      try {
+        url = anyNodeResolve(specifier, parent);
+      } catch {
+        break esm;
+      }
       const format = defaultGetFormatWithoutErrors(new URL(url), {
         parentURL: parent,
       });
@@ -386,9 +402,11 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
       } catch {
         break cjs;
       }
-      const format = defaultGetFormatWithoutErrors(toFileUrl(targetPath), {
-        parentURL: parent,
-      });
+      const format = (await Deno.stat(targetPath)).isFile
+        ? defaultGetFormatWithoutErrors(toFileUrl(targetPath), {
+          parentURL: parent,
+        })
+        : "unknown";
       let rp = await Deno.realPath(targetPath).then(
         (r) => relative(realPackagePath, r),
         () => relative(npmPackagePath, targetPath),
@@ -552,13 +570,44 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
         }
       } else {
         try {
-          const cjsInfo = analyzeCommonJS(text, item.path);
           const cjsResolver = createRequire(item.path);
           let hasCjs = false,
             hasJson = false;
+          const prev = [
+            "",
+            "",
+            "",
+          ];
           const requires = (
             await Promise.allSettled(
-              (cjsInfo?.requires as string[] | undefined)?.map(async (id) => {
+              Iterator.from(jsTokens(text)).flatMap((tok) => {
+                if (
+                  tok.type === "WhiteSpace" ||
+                  tok.type.endsWith("Comment")
+                ) return [];
+                const maybeRequire = tok.value === ")" &&
+                  /^[_$0-9]*require[_$0-9]*$/.test(prev[0]) &&
+                  prev[1] === "(";
+                prev.shift();
+                prev.push(tok.value);
+                if (maybeRequire) {
+                  const ast = parseSync(prev[1]);
+                  try {
+                    const ex = ast.program.body[0];
+                    if (ex.type === "ExpressionStatement") {
+                      const str = ex.expression;
+                      if (
+                        str.type === "Literal" && typeof str.value === "string"
+                      ) {
+                        return [str.value];
+                      }
+                    }
+                  } finally {
+                    ast.free();
+                  }
+                }
+                return [];
+              }).map(async (id) => {
                 let [, module, subpath] =
                   id.match(/^(@[^\/@]*\/[^\/@]*|[^\/@]+)((?:\/.*)?)$/) || [];
                 // relative
@@ -622,7 +671,7 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
                     format: "commonjs",
                   };
                 }
-              }) || [],
+              }),
             )
           ).flatMap((e) =>
             e.status === "fulfilled" ? e.value : (console.warn(e.reason), [])
@@ -681,7 +730,10 @@ export async function npmToJsr(npmPackagePath: string, outputPath: string) {
             let i = 0;
             do {
               const name = base + (i ? "_" + i : "");
-              if (!names.has(name)) return name;
+              if (!names.has(name)) {
+                names.add(name);
+                return name;
+              }
               i++;
             } while (true);
           }
